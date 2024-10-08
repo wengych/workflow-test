@@ -1,0 +1,127 @@
+name: Deploy sea
+
+on:
+  workflow_call:
+    inputs:
+      release_version:
+        required: true
+        type: string
+      env:
+        required: true
+        type: string
+      restart_driverjob:
+        required: true
+        type: boolean
+      restart_driverjob_batch_size:
+        type: number
+      restart_driverjob_batch_interval:
+        type: number
+  workflow_dispatch:
+    inputs:
+      env:
+        required: true
+        type: choice
+        description: Environment to be Deployed
+        options:
+          - prod
+          - staging
+          - test
+      release_version:
+        description: Forced Version (don't use this field!)
+        required: false
+        type: string # TODO make this optional so it could just pick the latest tag
+      restart_driverjob:
+        description: Restart DriverJobs with updated configuration
+        required: true
+        type: boolean
+        default: true
+      restart_driverjob_batch_size:
+        description: Batch size of restarting DriverJobs
+        required: true
+        type: number
+        default: 10
+      restart_driverjob_batch_interval:
+        description: Batch interval of restarting DriverJobs in second
+        required: true
+        type: number
+        default: 30
+
+jobs:
+  deploy-sea:
+    runs-on: [self-hosted]
+#    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    environment:
+      name: '${{ inputs.env }}'
+      url: ${{ inputs.env == 'prod' && 'https://app.sentio.xyz' || format('https://{0}.sentio.xyz', inputs.env) }}
+    steps:
+      - name: Choose Version
+        id: vars
+        if: ${{ inputs.release_version == null }}
+        run: |
+          if [[ "${{ startsWith(github.ref, 'refs/tags/v') }}" == "true" ]]; then
+              echo "release_version=${GITHUB_REF#refs/*/}" >> $GITHUB_OUTPUT
+          else
+              echo "Must Choose a valid Tag (not branch) doing Release workflow" >> $GITHUB_STEP_SUMMARY
+              exit 1
+          fi
+      - name: Split branch name
+        env:
+          BRANCH: ${{ inputs.release_version }}
+        id: split
+        run: |
+          echo $BRANCH
+          echo ${BRANCH%%-patch*}
+          echo "fragment=${BRANCH%%-patch*}" >> $GITHUB_OUTPUT
+      - name: 'Checkout Production Repo (with version branch)'
+        uses: actions/checkout@v4
+        if: ${{ inputs.release_version != 'dev' }}
+        with:
+          repository: sentioxyz/production
+          token: ${{ secrets.ACCESS_TOKEN }}
+          ref: ${{ steps.split.outputs.fragment }}
+      - name: 'Checkout Production Repo (with head)'
+        uses: actions/checkout@v4
+        if: ${{ inputs.release_version == 'dev' }}
+        with:
+          repository: sentioxyz/production
+          token: ${{ secrets.ACCESS_TOKEN }}
+      - name: Setup Helm & Helmfile
+        uses: mamezou-tech/setup-helmfile@v2.0.0
+        continue-on-error: true
+        with:
+          install-kubectl: no
+      - name: Deploy with Helmfile
+        run: |
+          echo "${{ secrets.SENTIO_KUBECONFIG_CONTENT }}" > $GITHUB_WORKSPACE/sentio-kubeconfig
+          chmod 600 $GITHUB_WORKSPACE/sentio-kubeconfig
+          export KUBECONFIG=$GITHUB_WORKSPACE/sentio-kubeconfig
+          helmfile sync --set version=${{ inputs.release_version || steps.vars.outputs.release_version }} --selector ciDeploy=true
+        working-directory: ./k8s-sea/${{ inputs.env }}
+      - name: Restart DriverJobs
+        if: ${{ inputs.restart_driverjob }}
+        run: |
+          echo "${{ secrets.SENTIO_KUBECONFIG_CONTENT }}" > $GITHUB_WORKSPACE/sentio-kubeconfig
+          chmod 600 $GITHUB_WORKSPACE/sentio-kubeconfig
+          export KUBECONFIG=$GITHUB_WORKSPACE/sentio-kubeconfig
+          if [[ "${{ inputs.env }}" == "test" ]]; then
+              scripts/driver-delete-pods.sh test
+          else
+              scripts/driver-upgrade.sh ${{ inputs.env }} ${{ inputs.restart_driverjob_batch_size }} ${{ inputs.restart_driverjob_batch_interval }}
+          fi
+#       - name: Deploy with Helmfile (driver-test-framework)
+#         if: ${{ inputs.env == 'test' }}
+#         run: |
+#           echo "${{ secrets.SENTIO_KUBECONFIG_CONTENT }}" > $GITHUB_WORKSPACE/sentio-kubeconfig
+#           chmod 600 $GITHUB_WORKSPACE/sentio-kubeconfig
+#           export KUBECONFIG=$GITHUB_WORKSPACE/sentio-kubeconfig
+#           helmfile sync --set version=dev --selector ciDeploy=true
+#         working-directory: ./k8s/driver-test-framework
+      - name: summary
+        env:
+          DEPLOY_ENV: ${{ inputs.env }}
+        run: |
+          echo "### Deployed to ${{ inputs.env }}:rocket:" >> $GITHUB_STEP_SUMMARY
+          echo "version: ${{ inputs.release_version || steps.vars.outputs.release_version }}" >> $GITHUB_STEP_SUMMARY
+          if [[ "${{ inputs.env }}" == "staging" ]]; then
+            echo "staging-driver-tests: http://sentio:wiFDYCsqcnn3yaU@staging.sentio.xyz/dashboard" >> $GITHUB_STEP_SUMMARY
+          fi

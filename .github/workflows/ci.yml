@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - v*
+#  pull_request:
+#    branches: [ main ]
+
+concurrency:
+  group: '${{ github.workflow }} @ ${{ github.event.pull_request.head.label || github.head_ref || github.ref }}'
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: [self-hosted]
+    timeout-minutes: 90
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+    outputs:
+      release_version: ${{ steps.vars.outputs.tag }}
+      env: ${{ steps.vars.outputs.env }}
+    steps:
+      - name: 'Checkout Repo'
+        uses: actions/checkout@v4
+      - name: 'Set up Python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Set output
+        id: vars
+        run: |
+          if [[ "${{ startsWith(github.ref, 'refs/tags/v') }}" == "true" ]]; then
+            echo "tag=${GITHUB_REF#refs/*/}" >> $GITHUB_OUTPUT
+            echo "env=staging" >> $GITHUB_OUTPUT
+          else
+            echo "tag=dev" >> $GITHUB_OUTPUT
+            echo "env=test" >> $GITHUB_OUTPUT
+          fi
+      - name: 'Authorize GCP Credential'
+        id: 'auth'
+        uses: 'google-github-actions/auth@v2'
+        with:
+          credentials_json: '${{ secrets.GOOGLE_CREDENTIALS }}'
+      - name: 'Set up GCP SDK'
+        uses: 'google-github-actions/setup-gcloud@v2'
+        # with:
+        #   version: '418.0.0'
+      - name: 'Authorize GCP Registry'
+        run: 'gcloud auth configure-docker us-west1-docker.pkg.dev'
+      - uses: bazelbuild/setup-bazelisk@v3
+      - run: bazel info
+      - name: Clean app source cache # TODO this should no need
+        run:  rm -rf bazel-out/*/bin/app/pages bazel-out/*/bin/app/middleware bazel-out/*/bin/app/components bazel-out/*/bin/app/gen bazel-out/*/bin/app/lib bazel-out/*/bin/app/styles bazel-out/*/bin/app/tests bazel-out/*/bin/app/emails
+      - name: Build & Test All
+        run: bazel test --config=ci -- //...
+      - name: Build & Push Images
+        if: ${{ github.event_name == 'push' }} # pull_request only for debug
+        run: ./scripts/publish-images.sh
+        env:
+          RELEASE_VERSION: ${{ steps.vars.outputs.tag }}
+  deploy-gke:
+    uses: ./.github/workflows/deploy-gke.yml
+    needs: build
+    with:
+      release_version: ${{ needs.build.outputs.release_version }}
+      env: ${{ needs.build.outputs.env }}
+      restart_driverjob: true
+      restart_driverjob_batch_size: 10
+      restart_driverjob_batch_interval: 30
+    secrets: inherit
+  deploy-sea:
+    uses: ./.github/workflows/deploy-sea.yml
+    needs: build
+    with:
+      release_version: ${{ needs.build.outputs.release_version }}
+      env: ${{ needs.build.outputs.env }}
+      restart_driverjob: true
+      restart_driverjob_batch_size: 10
+      restart_driverjob_batch_interval: 30
+    secrets: inherit
+
+  upload-website:
+    uses: ./.github/workflows/upload-website.yml
+    needs: build
+    with:
+      env: ${{ needs.build.outputs.env }}
+    secrets: inherit
+#  e2e-test:
+#    uses: ./.github/workflows/e2e_runner.yml
+#    needs:
+#      - build
+#      - deploy
+#    with:
+#      env: ${{ needs.build.outputs.env }}
+#    secrets: inherit
+  driver-test:
+    if: ${{ needs.build.outputs.env == 'staging' }}
+    uses: ./.github/workflows/run_driver_test_suite.yml
+    needs:
+      - build
+      - deploy
+    with:
+      deployEnv: ${{ needs.build.outputs.env }}
+      deployVersion: ${{ needs.build.outputs.release_version }}
+    secrets: inherit

@@ -1,0 +1,109 @@
+name: 'Run Driver Test Suite'
+
+on:
+  workflow_call:
+    inputs:
+      deployEnv:
+        required: true
+        type: string
+      deployVersion:
+        required: true
+        type: string
+      driver_extra_args:
+        required: false
+        type: string
+  workflow_dispatch:
+    inputs:
+      suite_config:
+        description: 'Suite config path relative to production/driver-test/suites (all if empty)'
+        required: false
+        type: string
+      driver_extra_args:
+        description: 'Extra args to pass to driver'
+        required: false
+        type: string
+  schedule:
+    - cron: '0 8 * * *'
+
+env:
+  CLIENT_IMAGE: us-west1-docker.pkg.dev/sentio-352722/sentio/driver-test-framework/client:dev
+  RUN_NAMESPACE: driver-test
+  SERVER_URL: dtf-server:10086
+  RUN_OVERRIDES: "'{\"spec\":{\"serviceAccount\":\"dtf-sentio-sa\"}}'"
+
+jobs:
+  run_suite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 'Checkout Production Repo'
+        uses: actions/checkout@v4
+        with:
+          repository: sentioxyz/production
+          token: ${{ secrets.ACCESS_TOKEN }}
+      - name: 'Authorize GCP Credential'
+        id: 'auth'
+        uses: 'google-github-actions/auth@v2'
+        with:
+          credentials_json: '${{ secrets.GOOGLE_CREDENTIALS }}'
+      - name: 'Set up GCP SDK'
+        uses: 'google-github-actions/setup-gcloud@v2'
+      - name: "Setup GKE credential"
+        uses: 'google-github-actions/get-gke-credentials@v2'
+        with:
+          cluster_name: sentio-gke
+          location: us-west1
+      - name: Run Driver Test Suite (workflow_dispatch)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.suite_config != '' }}
+        env:
+          CONFIG_NAME: ${{ inputs.suite_config }}
+          DRIVER_EXTRA_ARGS: ${{ inputs.driver_extra_args || '' }}
+        run: |
+          kubectl wait --for=condition=ready pod/dtf-server-0 -n driver-test
+          kubectl run dtf-launcher --image $CLIENT_IMAGE --namespace $RUN_NAMESPACE --image-pull-policy Always --overrides='{"spec":{"serviceAccount":"dtf-sentio-sa"}}' --wait=true --rm=true --restart=Never --stdin=true -- -server_url $SERVER_URL run-local-suite stdin < $GITHUB_WORKSPACE/driver-test/suites/$CONFIG_NAME
+      - name: Run Driver Test Suite (all)
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.suite_config == '' }}
+        env:
+          DEPLOY_ENV: ${{ inputs.deployEnv || '' }}
+          DEPLOY_VERSION: ${{ inputs.deployVersion || '' }}
+          DRIVER_EXTRA_ARGS: ${{ inputs.driver_extra_args || '' }}
+        run: |
+          kubectl wait --for=condition=ready pod/dtf-server-0 -n driver-test
+          cd $GITHUB_WORKSPACE/driver-test/suites
+          if [[ -z "$DEPLOY_ENV" ]]; then
+            TRIGGER="schedule"
+          else
+            TRIGGER="$DEPLOY_ENV $DEPLOY_VERSION"
+            kubectl run dtf-launcher --image $CLIENT_IMAGE --namespace $RUN_NAMESPACE --image-pull-policy Always --overrides='{"spec":{"serviceAccount":"dtf-sentio-sa"}}' --wait=true --rm=true --restart=Never --stdin=true -- -server_url $SERVER_URL kill "trigger=${DEPLOY_ENV}.+"
+          fi
+          for filename in *.yaml; do
+            kubectl run dtf-launcher --image $CLIENT_IMAGE --namespace $RUN_NAMESPACE --image-pull-policy Always --overrides='{"spec":{"serviceAccount":"dtf-sentio-sa"}}' --wait=true --rm=true --restart=Never --stdin=true -- -server_url $SERVER_URL -trigger "$TRIGGER" run-local-suite stdin < $filename
+          done
+      - name: "Generate T+1 Report"
+        if: ${{ github.event_name == 'schedule' }}
+        env:
+          REPORT_TEMPLATE: /app/driver-test-framework/client/image.binary.runfiles/sentio/driver-test-framework/client/report-template.html
+          NUM_RUNS: 5
+        run: |
+          mkdir -p $GITHUB_WORKSPACE/reports
+          cd $GITHUB_WORKSPACE/driver-test/suites
+          for filename in *.yaml; do
+            kubectl run dtf-launcher --image $CLIENT_IMAGE --namespace $RUN_NAMESPACE --image-pull-policy Always --overrides='{"spec":{"serviceAccount":"dtf-sentio-sa"}}' --wait=true --rm=true --restart=Never --stdin=true -- -server_url $SERVER_URL -report_num_runs $NUM_RUNS -report_template $REPORT_TEMPLATE generate-report stdin < $filename > $GITHUB_WORKSPACE/reports/${filename}.report.html || true
+          done
+      - name: "Upload T+1 Report to GCS"
+        if: ${{ github.event_name == 'schedule' }}
+        uses: 'google-github-actions/upload-cloud-storage@v2'
+        with:
+          path: '${{ github.workspace }}/reports'
+          destination: 'sentio-driver-test/ci-reports/${{ github.run_number }}'
+          parent: false
+          headers: |-
+            content-type: text/html
+      - name: "summary"
+        if: ${{ github.event_name == 'schedule' }}
+        run: |
+          echo "### T+1 Test Reports" >> $GITHUB_STEP_SUMMARY
+          cd $GITHUB_WORKSPACE/reports
+          for filename in *.html; do
+            echo "- [$filename](https://storage.cloud.google.com/sentio-driver-test/ci-reports/${{ github.run_number }}/$filename)" >> $GITHUB_STEP_SUMMARY
+          done

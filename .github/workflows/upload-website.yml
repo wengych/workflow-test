@@ -1,0 +1,79 @@
+name: Upload Website
+
+on:
+  workflow_call:
+    inputs:
+      env:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      env:
+        required: true
+        type: choice
+        description: Environment to be Deployed
+        options:
+          - prod
+#          - staging
+          - test
+      force:
+        required: true
+        type: boolean
+        default: true
+        description: If skip file change check
+#  push:
+#    branches:
+#      - master
+#    paths:
+#      - 'website/**'
+#      - '.github/workflows/upload-website.yml'
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: ${{ inputs.env != 'staging' }}
+    environment:
+      name: '${{ inputs.env }}'
+      url: ${{ inputs.env == 'prod' && 'https://website.sentio.xyz' || format('https://website-{0}.sentio.xyz', inputs.env) }}
+    steps:
+      - name: 'Checkout Repo'
+        uses: actions/checkout@v4
+      - name: 'Authorize GCP Credential'
+        id: 'auth'
+        uses: 'google-github-actions/auth@v2'
+        with:
+          credentials_json: '${{ secrets.GOOGLE_CREDENTIALS }}'
+      - name: 'Set up GCP SDK'
+        uses: 'google-github-actions/setup-gcloud@v2'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - name: Get changed files in the docs folder
+        id: changed-files-specific
+        uses: tj-actions/changed-files@v41
+        with:
+          files: website/**
+      - uses: actions/setup-node@v4
+        if: steps.changed-files-specific.outputs.any_changed == 'true' || inputs.force == true
+        with:
+          cache: pnpm
+          node-version: 20
+      - name: 'Build Website'
+        if: steps.changed-files-specific.outputs.any_changed == 'true' || inputs.force == true
+        run: |
+          sed -i.bak '/app/d' ../pnpm-workspace.yaml
+          pnpm install
+          pnpm build:deps
+          pnpm build
+        working-directory: website
+      - name: 'Upload Files'
+        if: steps.changed-files-specific.outputs.any_changed == 'true' || inputs.force == true
+        uses: 'google-github-actions/upload-cloud-storage@v2'
+        with:
+          path: website/out
+          destination: ${{ inputs.env == 'prod' && 'sentio-website' || format('sentio-website-{0}', inputs.env) }}
+          parent: false
+      - name: Run step if any file(s) in the docs folder change
+        if: steps.changed-files-specific.outputs.any_changed == 'false' && inputs.force == false
+        run: |
+          echo "Nothing has changed for website"

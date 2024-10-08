@@ -1,0 +1,32 @@
+name: Deploy
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: '${{ github.workflow }} @ ${{ github.event.pull_request.head.label || github.head_ref || github.ref }}'
+  cancel-in-progress: true
+
+jobs:
+  deploy-gke:
+    uses: ./.github/workflows/deploy-gke.yml
+    needs: build
+    with:
+      release_version: ${{ needs.build.outputs.release_version }}
+      env: ${{ needs.build.outputs.env }}
+      restart_driverjob: true
+      restart_driverjob_batch_size: 10
+      restart_driverjob_batch_interval: 30
+    secrets: inherit
+  deploy-sea:
+    uses: ./.github/workflows/deploy-sea.yml
+    needs: build
+    with:
+      release_version: ${{ needs.build.outputs.release_version }}
+      env: ${{ needs.build.outputs.env }}
+      restart_driverjob: true
+      restart_driverjob_batch_size: 10
+      restart_driverjob_batch_interval: 30
+    secrets: inherit
